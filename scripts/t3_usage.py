@@ -10,7 +10,9 @@ How it reads T3 Code:
      read-only bearer token. It is cached (0600) under $XDG_RUNTIME_DIR and
      reissued shortly before it expires; the replaced session is revoked.
   3. A WebSocket RPC call to `server.getConfig` returns every provider with
-     its `usageLimits.windows` (the same data as T3's Usage -> Limits page).
+     its `usageLimits.windows`, and the `subscribeServerConfig` stream adds the
+     accounts of every CLIProxyAPI hub set up under Settings -> Providers ->
+     Usage providers. Together that is what T3's Usage -> Limits page shows.
 
 Standard library only: the WebSocket client below is the minimum needed for
 one request/response on loopback.
@@ -39,6 +41,8 @@ TOKEN_TTL = "12h"
 TOKEN_LABEL = "dms-t3-usage"
 REISSUE_BEFORE_EXPIRY_S = 5 * 60
 NET_TIMEOUT_S = 8
+# How long to wait for the hub-accounts event once the config snapshot is in.
+SOURCES_GRACE_S = 2
 CLI_TIMEOUT_S = 15
 MAX_FRAME = 16 * 1024 * 1024
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -357,6 +361,88 @@ def failure_tag(exit_: dict) -> str:
     return "a failure"
 
 
+class StreamUnsupported(Exception):
+    """The server rejected the stream request itself; fall back to getConfig."""
+
+
+def read_config_stream(server: dict, token: str) -> tuple[dict, list]:
+    """Reads the first config snapshot and usage-limit sources from T3's config stream.
+
+    Hub accounts (CLIProxyAPI "usage providers" in T3's settings) only travel on
+    this stream, opted in with `usageLimitSources`; `server.getConfig` never
+    carries them.
+    """
+    ws = WebSocket(
+        server["host"],
+        server["port"],
+        f"/ws?orchestrationProtocol={PROTOCOL}",
+        {"Authorization": f"Bearer {token}"},
+    )
+    config, sources = None, None
+    try:
+        ws.send_text(json.dumps({
+            "_tag": "Request",
+            "id": "1",
+            "tag": "subscribeServerConfig",
+            "payload": {"usageLimitSources": True, "workspaceSnapshotsOnDemand": True, "providerCatalogsOnDemand": True},
+            "headers": [],
+        }))
+        deadline = time.monotonic() + NET_TIMEOUT_S
+        while time.monotonic() < deadline and (config is None or sources is None):
+            if config is not None:
+                # The snapshot is in; a server without hub support never sends
+                # the sources event, so do not wait long for it.
+                ws.sock.settimeout(SOURCES_GRACE_S)
+            try:
+                frame = json.loads(ws.recv_text())
+            except socket.timeout:
+                if config is not None:
+                    break
+                raise T3Error("error", "T3 Code did not answer in time")
+            except ValueError:
+                raise T3Error("error", "T3 Code sent a frame that is not JSON")
+            if not isinstance(frame, dict):
+                continue
+            kind = frame.get("_tag")
+            if kind == "Ping":
+                ws.send_text(json.dumps({"_tag": "Pong"}))
+            elif kind == "Defect":
+                raise StreamUnsupported()
+            elif kind == "Exit" and str(frame.get("requestId")) == "1":
+                if (frame.get("exit") or {}).get("_tag") != "Success" and config is None:
+                    raise StreamUnsupported()
+                break
+            elif kind == "Chunk" and str(frame.get("requestId")) == "1":
+                for event in frame.get("values") or []:
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("type") == "snapshot" and isinstance(event.get("config"), dict):
+                        config = event["config"]
+                        if isinstance(config.get("usageLimitSources"), list):
+                            sources = config["usageLimitSources"]
+                    elif event.get("type") == "usageLimitSourcesUpdated":
+                        payload = event.get("payload") or {}
+                        if isinstance(payload.get("sources"), list):
+                            sources = payload["sources"]
+                ws.send_text(json.dumps({"_tag": "Ack", "requestId": "1"}))
+        if config is None:
+            raise T3Error("error", "T3 Code did not answer in time")
+        try:
+            ws.send_text(json.dumps({"_tag": "Interrupt", "requestId": "1"}))
+        except OSError:
+            pass
+        return config, sources or []
+    finally:
+        ws.close()
+
+
+def read_state(server: dict, token: str) -> tuple[dict, list]:
+    try:
+        return read_config_stream(server, token)
+    except StreamUnsupported:
+        return rpc(server, token, "server.getConfig"), []
+
+
 def token_lock():
     """Serialises token issuance between widget instances (one per bar/screen)."""
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -370,7 +456,7 @@ def unlock(fd: int) -> None:
     os.close(fd)
 
 
-def get_config(server: dict):
+def with_token(server: dict, call):
     lock = token_lock()
     try:
         cached = read_cached_token()
@@ -378,7 +464,7 @@ def get_config(server: dict):
     finally:
         unlock(lock)
     try:
-        return rpc(server, token["token"], "server.getConfig")
+        return call(token["token"])
     except HttpStatus as exc:
         if exc.status == 426:
             raise T3Error("unsupported", f"T3 Code {server['version'] or ''} speaks a newer protocol than this plugin".replace("  ", " "))
@@ -393,85 +479,199 @@ def get_config(server: dict):
     finally:
         unlock(lock)
     try:
-        return rpc(server, token["token"], "server.getConfig")
+        return call(token["token"])
     except HttpStatus as exc:
         raise T3Error("refused" if exc.status == 401 else "error", f"T3 Code refused a fresh token ({exc})")
 
 
 # --------------------------------------------------------------------------
 # Shape the reply for the widget
+#
+# Like T3's Limits page, limits are grouped per provider (driver): Claude,
+# Codex, ... Each group pools its accounts, the local sign-in plus every
+# account a CLIProxyAPI hub reports, and a pooled window shows the average
+# share left across the accounts that have it.
 
 
-def provider_name(provider: dict) -> str:
-    for key in ("displayName", "name", "label"):
-        value = provider.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    driver = str(provider.get("driver") or provider.get("instanceId") or "?")
-    return DRIVER_NAMES.get(driver, driver[:1].upper() + driver[1:])
+def driver_name(driver: str, fallback: str = "") -> str:
+    if driver in DRIVER_NAMES:
+        return DRIVER_NAMES[driver]
+    if fallback.strip():
+        return fallback.strip()
+    return driver[:1].upper() + driver[1:] if driver else "?"
 
 
-def shape(config) -> list[dict]:
-    providers = config.get("providers") if isinstance(config, dict) else None
-    if not isinstance(providers, list):
-        raise T3Error("error", "T3 Code's config has no providers list")
-    out = []
-    for p in providers:
+def clean_windows(limits) -> list[dict]:
+    windows = []
+    if not isinstance(limits, dict):
+        return windows
+    for w in limits.get("windows") or []:
+        if not isinstance(w, dict) or not isinstance(w.get("usedPercent"), (int, float)):
+            continue
+        windows.append({
+            "id": str(w.get("id") or ""),
+            "kind": str(w.get("kind") or ""),
+            "label": str(w.get("label") or w.get("id") or "Limit").strip()[:40],
+            "usedPercent": max(0.0, min(100.0, float(w["usedPercent"]))),
+            "resetsAt": w.get("resetsAt") if isinstance(w.get("resetsAt"), str) else None,
+            "windowDurationMins": w.get("windowDurationMins") if isinstance(w.get("windowDurationMins"), int) else None,
+        })
+    return windows
+
+
+def unavailable_of(limits) -> tuple[str | None, str]:
+    unavailable = limits.get("unavailable") if isinstance(limits, dict) else None
+    if not isinstance(unavailable, dict):
+        return None, ""
+    return str(unavailable.get("reason") or "unavailable"), str(unavailable.get("message") or "")[:200]
+
+
+def account_badge(email, index: int) -> str:
+    # T3 marks hub accounts with the first letter of their email; only that
+    # letter is kept, never the address.
+    if isinstance(email, str) and email.strip():
+        return email.strip()[0].upper()
+    return str(index)
+
+
+def collect_accounts(config, sources) -> tuple[list[dict], list[str]]:
+    accounts, warnings = [], []
+    for p in (config.get("providers") if isinstance(config, dict) else None) or []:
         if not isinstance(p, dict) or p.get("enabled") is False:
             continue
         limits = p.get("usageLimits")
         if not isinstance(limits, dict):
             continue
-        windows = []
-        for w in limits.get("windows") or []:
-            if not isinstance(w, dict) or not isinstance(w.get("usedPercent"), (int, float)):
-                continue
-            windows.append({
-                "id": str(w.get("id") or ""),
-                "kind": str(w.get("kind") or ""),
-                "label": str(w.get("label") or w.get("id") or "Limit").strip()[:40],
-                "usedPercent": max(0.0, min(100.0, float(w["usedPercent"]))),
-                "resetsAt": w.get("resetsAt") if isinstance(w.get("resetsAt"), str) else None,
-                "windowDurationMins": w.get("windowDurationMins") if isinstance(w.get("windowDurationMins"), int) else None,
-            })
-        unavailable = limits.get("unavailable")
-        reason, reason_message = None, ""
-        if isinstance(unavailable, dict):
-            reason = str(unavailable.get("reason") or "unavailable")
-            reason_message = str(unavailable.get("message") or "")[:200]
-        # "unsupported" means this account has no limits to report (API keys,
-        # custom endpoints, ...): nothing to show, so leave it out.
+        windows = clean_windows(limits)
+        reason, message = unavailable_of(limits)
+        # "unsupported" means this sign-in has no limits to report (API keys,
+        # custom endpoints such as a hub, ...): nothing to show.
         if not windows and reason in (None, "unsupported"):
             continue
         auth = p.get("auth") if isinstance(p.get("auth"), dict) else {}
-        out.append({
-            "id": str(p.get("instanceId") or p.get("driver") or ""),
-            "driver": str(p.get("driver") or ""),
-            "name": provider_name(p),
-            "status": str(p.get("status") or ""),
-            "auth": str(auth.get("status") or ""),
-            # auth.type is the plan name ("Claude Pro"); auth.email is never read.
+        driver = str(p.get("driver") or "")
+        accounts.append({
+            "driver": driver,
+            "name": driver_name(driver, str(p.get("displayName") or "")),
+            # auth.type is the plan name ("Claude Pro").
             "plan": str(auth.get("type") or "")[:40],
-            "checkedAt": limits.get("checkedAt") if isinstance(limits.get("checkedAt"), str) else None,
+            "badge": "",
+            "source": "",
             "unavailable": reason,
-            "unavailableMessage": reason_message,
+            "unavailableMessage": message,
             "windows": windows,
         })
+    for src in sources or []:
+        if not isinstance(src, dict):
+            continue
+        label = str(src.get("label") or "hub")[:60]
+        if src.get("error"):
+            warnings.append(f"{label}: {str(src['error'])[:200]}")
+        for index, acct in enumerate(src.get("accounts") or [], start=1):
+            if not isinstance(acct, dict):
+                continue
+            limits = acct.get("usageLimits")
+            windows = clean_windows(limits)
+            reason, message = unavailable_of(limits)
+            if not windows and reason in (None, "unsupported"):
+                continue
+            driver = str(acct.get("driver") or "")
+            accounts.append({
+                "driver": driver,
+                "name": driver_name(driver),
+                "plan": str(acct.get("plan") or "")[:40],
+                "badge": account_badge(acct.get("email"), index),
+                "source": label,
+                "unavailable": reason,
+                "unavailableMessage": message,
+                "windows": windows,
+            })
+    return accounts, warnings
+
+
+def pooled_windows(accounts: list[dict]) -> list[dict]:
+    pooled: dict[str, dict] = {}
+    for n, acct in enumerate(accounts):
+        for w in acct["windows"]:
+            key = w["label"].lower()
+            entry = pooled.setdefault(key, {
+                "id": w["id"], "kind": w["kind"], "label": w["label"],
+                "windowDurationMins": w["windowDurationMins"], "accounts": [],
+            })
+            entry["accounts"].append({
+                "badge": acct["badge"] or acct["plan"] or str(n + 1),
+                "plan": acct["plan"],
+                "usedPercent": w["usedPercent"],
+                "resetsAt": w["resetsAt"],
+            })
+    out = []
+    for entry in pooled.values():
+        members = entry["accounts"]
+        entry["usedPercent"] = sum(a["usedPercent"] for a in members) / len(members)
+        resets = sorted(a["resetsAt"] for a in members if a["resetsAt"])
+        entry["resetsAt"] = resets[0] if resets else None
+        if len(members) == 1:
+            entry["accounts"] = []
+        out.append(entry)
     return out
+
+
+def shape(config, sources) -> tuple[list[dict], list[str]]:
+    if not isinstance(config, dict) or not isinstance(config.get("providers"), list):
+        raise T3Error("error", "T3 Code's config has no providers list")
+    accounts, warnings = collect_accounts(config, sources)
+    groups: dict[str, dict] = {}
+    for acct in accounts:
+        group = groups.setdefault(acct["driver"] or acct["name"], {
+            "id": acct["driver"] or acct["name"],
+            "driver": acct["driver"],
+            "name": acct["name"],
+            "members": [],
+        })
+        group["members"].append(acct)
+    out = []
+    for group in groups.values():
+        members = group.pop("members")
+        with_windows = [a for a in members if a["windows"]]
+        plans = sorted({a["plan"] for a in with_windows if a["plan"]})
+        sources_used = sorted({a["source"] for a in with_windows if a["source"]})
+        unavailable = next((a for a in members if a["unavailable"] and not a["windows"]), None)
+        group.update({
+            "plan": plans[0] if len(with_windows) == 1 and plans else "",
+            "accountCount": len(with_windows),
+            "sources": sources_used,
+            "windows": pooled_windows(with_windows),
+            "unavailable": unavailable["unavailable"] if unavailable and not with_windows else None,
+            "unavailableMessage": unavailable["unavailableMessage"] if unavailable and not with_windows else "",
+        })
+        out.append(group)
+    return out, warnings
+
+
+def redacted(value):
+    if isinstance(value, dict):
+        return {k: ("<redacted>" if k in ("email", "managementKey") else redacted(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redacted(v) for v in value]
+    return value
 
 
 def main(argv: list[str]) -> int:
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    doc: dict = {"ok": False, "state": "error", "message": "", "serverVersion": "", "fetchedAt": now, "providers": []}
+    doc: dict = {"ok": False, "state": "error", "message": "", "serverVersion": "", "fetchedAt": now, "providers": [], "warnings": []}
     try:
         server = find_server()
         doc["serverVersion"] = server["version"]
-        config = get_config(server)
+        config, sources = with_token(server, lambda token: read_state(server, token))
         if "--raw" in argv:
-            json.dump(config, sys.stdout, indent=2)
+            limits = [
+                {"instanceId": p.get("instanceId"), "driver": p.get("driver"), "usageLimits": p.get("usageLimits")}
+                for p in config.get("providers") or [] if isinstance(p, dict)
+            ]
+            json.dump(redacted({"providers": limits, "usageLimitSources": sources}), sys.stdout, indent=2)
             print()
             return 0
-        doc["providers"] = shape(config)
+        doc["providers"], doc["warnings"] = shape(config, sources)
         doc["ok"] = True
         doc["state"] = "ok"
     except T3Error as exc:

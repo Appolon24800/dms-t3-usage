@@ -16,6 +16,7 @@ PluginComponent {
     id: root
 
     property var providers: []
+    property var warnings: []
     property string t3State: "loading"     // loading | ok | closed | restart | refused | unsupported | error
     property string message: ""
     property string serverVersion: ""
@@ -25,8 +26,8 @@ PluginComponent {
     property int pillIndex: 0
     property real savedScrollY: 0
 
-    popoutWidth: 360
-    popoutHeight: 400
+    popoutWidth: 380
+    popoutHeight: 460
 
     pillRightClickAction: () => root.openT3()
 
@@ -80,6 +81,9 @@ PluginComponent {
                 return;
             }
             lastSuccessMs = nowMs;
+            const nextWarnings = doc.warnings || [];
+            if (JSON.stringify(nextWarnings) !== JSON.stringify(warnings))
+                warnings = nextWarnings;
             const next = doc.providers || [];
             // Skip identical documents: a fresh array resets the ListView and
             // jumps the scroll position back to the top.
@@ -190,12 +194,35 @@ PluginComponent {
         if (left <= 0)
             return "Resetting now";
         const sameDay = at.toDateString() === new Date(nowMs).toDateString();
-        return "Resets in " + duration(left) + " · " + Qt.formatDateTime(at, sameDay ? "HH:mm" : "ddd HH:mm");
+        // A pooled window carries its accounts' earliest reset.
+        const lead = (w.accounts || []).length > 1 ? "Next reset in " : "Resets in ";
+        return lead + duration(left) + " · " + Qt.formatDateTime(at, sameDay ? "HH:mm" : "ddd HH:mm");
+    }
+
+    function shortReset(a) {
+        if (!a || !a.resetsAt)
+            return "";
+        const left = new Date(a.resetsAt).getTime() - nowMs;
+        if (!Number.isFinite(left))
+            return "";
+        return left <= 0 ? " · now" : (" · " + duration(left));
+    }
+
+    function groupSubtitle(g) {
+        if (!g)
+            return "";
+        if ((g.accountCount || 0) > 1) {
+            const via = (g.sources || []).length === 1 ? (" · " + g.sources[0]) : "";
+            return g.accountCount + " accounts" + via;
+        }
+        return g.plan || ((g.sources || []).length === 1 ? g.sources[0] : "");
     }
 
     function stateText() {
         switch (t3State) {
         case "ok":
+            // Hub errors (unreachable hub, bad management key) from T3.
+            return warnings.length > 0 ? warnings.join("\n") : "";
         case "loading":
             return "";
         case "closed":
@@ -376,7 +403,7 @@ PluginComponent {
 
                             StyledText {
                                 visible: text.length > 0
-                                text: providerBlock.modelData.plan || ""
+                                text: root.groupSubtitle(providerBlock.modelData)
                                 color: Theme.surfaceVariantText
                                 font.pixelSize: Theme.fontSizeSmall
                                 Layout.alignment: Qt.AlignVCenter
@@ -447,6 +474,52 @@ PluginComponent {
                                     color: Theme.surfaceVariantText
                                     font.pixelSize: Theme.fontSizeSmall
                                     wrapMode: Text.WordWrap
+                                }
+
+                                // One chip per pooled account, like the avatars
+                                // on T3's Limits page: badge, share left, reset.
+                                Flow {
+                                    visible: (windowCol.modelData.accounts || []).length > 0
+                                    width: parent.width
+                                    spacing: Theme.spacingS
+
+                                    Repeater {
+                                        model: windowCol.modelData.accounts || []
+
+                                        Row {
+                                            id: accountChip
+
+                                            required property var modelData
+
+                                            readonly property int leftPct: root.remaining(modelData)
+
+                                            spacing: 4
+
+                                            Rectangle {
+                                                width: 16
+                                                height: 16
+                                                radius: 8
+                                                color: Theme.primary
+                                                opacity: 0.85
+                                                anchors.verticalCenter: parent.verticalCenter
+
+                                                StyledText {
+                                                    anchors.centerIn: parent
+                                                    text: String(accountChip.modelData.badge || "?").substring(0, 1)
+                                                    color: Theme.onPrimary
+                                                    font.pixelSize: 10
+                                                    font.weight: Font.Bold
+                                                }
+                                            }
+
+                                            StyledText {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                text: accountChip.leftPct + "%" + root.shortReset(accountChip.modelData)
+                                                color: root.levelColor(accountChip.leftPct)
+                                                font.pixelSize: Theme.fontSizeSmall
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

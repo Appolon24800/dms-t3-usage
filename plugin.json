@@ -1,0 +1,19 @@
+{
+    "id": "t3Usage",
+    "name": "T3 Code Usage",
+    "description": "Bar pill and popout showing your AI subscription limits (Claude, Codex, Grok, ...) as T3 Code reports them, with a shortcut back to T3 Code",
+    "version": "0.1.0",
+    "author": "Appolon24800",
+    "icon": "data_usage",
+    "type": "widget",
+    "capabilities": ["dankbar-widget", "process"],
+    "component": "./T3UsageWidget.qml",
+    "settings": "./T3UsageSettings.qml",
+    "requires": ["t3", "python3"],
+    "requires_dms": ">=1.4.0",
+    "permissions": [
+        "settings_read",
+        "settings_write",
+        "process"
+    ]
+}

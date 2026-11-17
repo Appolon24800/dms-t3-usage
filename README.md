@@ -9,7 +9,8 @@ if T3 Code can see your limits, so can the bar.
   or weekly one), colored green, orange, then red as it runs out. With several
   providers it rotates between them.
 - **Popout**: every provider and window with a bar, what is left, and when it
-  resets (`Resets in 4h 38m · 23:19`).
+  resets (`Resets in 4h 38m · 23:19`). Providers with several accounts (a
+  CLIProxyAPI hub) are pooled like on T3's Limits page, with one chip per account.
 - **Back to T3 Code**: right-click the pill, or use the button in the popout,
   to bring T3 Code to the front (focuses its window on niri, launches it otherwise).
 
@@ -41,11 +42,20 @@ Then in DMS: **Settings → Plugins → T3 Code Usage → enable**, and add the
    cached `0600` in `$XDG_RUNTIME_DIR/dms-t3-usage/` and reissued shortly
    before it expires; the session it replaces is revoked. It shows up in T3 Code
    under Sharing & access as `dms-t3-usage`.
-3. Calls `server.getConfig` over T3's WebSocket RPC and keeps only each
-   provider's `usageLimits` windows and plan name. Account emails are never read.
+3. Opens T3's `subscribeServerConfig` stream over its WebSocket RPC, reads the
+   first snapshot, and closes. It keeps each provider's `usageLimits` windows
+   and plan name, plus the accounts of every CLIProxyAPI hub T3 polls. Only the
+   first letter of a hub account's email is kept, as its badge.
 
 Providers whose accounts have no limits to report (API keys, custom
 endpoints) are left out.
+
+### Codex (or anything) through a CLIProxyAPI hub
+
+When Codex talks to a hub instead of ChatGPT directly, T3 only knows its limits
+if the hub is added under **Settings → Providers → Usage providers → Add hub**
+(hub URL and management key). That setting is per environment: add it on the
+machine this widget runs on, or the widget only sees the local providers.
 
 ## Troubleshooting
 

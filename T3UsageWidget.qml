@@ -208,14 +208,23 @@ PluginComponent {
         return left <= 0 ? " · now" : (" · " + duration(left));
     }
 
+    // A hub without a label in T3 is named by its host ("100.127.211.126:8321"),
+    // which is noise in the popout; only real labels ("Vikou Hub") are shown.
+    function hubName(g) {
+        const sources = g.sources || [];
+        if (sources.length !== 1)
+            return "";
+        const label = String(sources[0]);
+        return /^[A-Za-z0-9.\-\[\]:]+$/.test(label) && /[.:]/.test(label) ? "" : label;
+    }
+
     function groupSubtitle(g) {
         if (!g)
             return "";
-        if ((g.accountCount || 0) > 1) {
-            const via = (g.sources || []).length === 1 ? (" · " + g.sources[0]) : "";
-            return g.accountCount + " accounts" + via;
-        }
-        return g.plan || ((g.sources || []).length === 1 ? g.sources[0] : "");
+        const hub = hubName(g);
+        if ((g.accountCount || 0) > 1)
+            return g.accountCount + " accounts" + (hub.length > 0 ? (" · " + hub) : "");
+        return g.plan || hub;
     }
 
     function stateText() {
